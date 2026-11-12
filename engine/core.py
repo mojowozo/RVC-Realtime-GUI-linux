@@ -44,6 +44,7 @@ from engine.settings import (
 )
 from engine.version import APP_TITLE, BUILD_LABEL
 from infer import rtrvc as rvc_for_realtime
+from infer.hubert import checkpoint_embedder, load_hubert_model, warm_embedder
 from tools.audio_fifo import AudioFrameFifo, enqueue_latest
 from tools.audio_routing import is_native_api, scatter_mono, select_channels
 from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph, side_gpu_work
@@ -53,7 +54,9 @@ from tools import rnnoise
 from tools.limiter import soft_clip
 from tools.loudness import TARGETS_LUFS, LoudnessMeter
 from tools.model_registry import (
+    IndexFileError,
     TrashError,
+    attach_index,
     discover_models,
     model_name_problem,
     move_to_trash,
@@ -99,6 +102,9 @@ RESUME_RAMP_SECONDS = 0.005
 BACKLOG_MARGIN_SECONDS = 0.060
 #: How often a growing underrun count is logged.
 UNDERRUN_LOG_SECONDS = 5.0
+#: A device latency above this is a bogus report, not a real buffer: some
+#: PipeWire JACK nodes make PortAudio report 2**32 - period frames (~89478 s).
+MAX_PLAUSIBLE_STREAM_LATENCY = 2.0
 FUNCTIONS = {"vc": "vc", "passthrough": "im"}
 
 
@@ -117,6 +123,20 @@ def printt(strr, *args):
         print(strr)
     else:
         print(strr % args)
+
+
+def plausible_stream_latency(latency):
+    """The device's reported latency in seconds, or 0.0 if it is impossible."""
+    if isinstance(latency, (tuple, list)):
+        latency = latency[-1]
+    try:
+        latency = float(latency)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(latency) or not 0.0 <= latency <= MAX_PLAUSIBLE_STREAM_LATENCY:
+        printt("Ignoring the device's reported latency of %.3f s: not plausible", latency)
+        return 0.0
+    return latency
 
 
 def peak_meter(samples):
@@ -192,6 +212,11 @@ class RealtimeEngine:
         self.voice_pitch = PitchHistogram.load(VOICE_PITCH_PATH)
         self.voice_pitch_saved_at = time.monotonic()
         self.pitch_analysis = None
+        #: Model being loaded in the background for a hot swap, and a loaded
+        #: one waiting for the audio thread to take it at a chunk boundary.
+        self.model_swap = None
+        self.pending_swap = None
+        self.swapped_model = None
         self.normalize_settings()
         self.settings.__dict__.update(self.model_settings_for(self.settings.model_name))
         self.log_startup_diagnostics()
@@ -230,6 +255,7 @@ class RealtimeEngine:
             "missing_assets": missing_assets(),
             "voice_pitch": self.voice_pitch.summary(),
             "analyzing_pitch": self.pitch_analysis is not None,
+            "switching_model": self.model_swap["name"] if self.model_swap else None,
         }
 
     def emit_state(self):
@@ -364,6 +390,26 @@ class RealtimeEngine:
         save_settings(self.settings)
         self.status("model_renamed", name=name, new_name=new_name)
 
+    def add_index(self, name, path):
+        """Give a model an .index file, replacing any it had (old one to the Trash)."""
+        model = self.models_by_name.get(name)
+        if model is None:
+            raise EngineError("no_model", f"Unknown model: {name}")
+        try:
+            target, replaced = attach_index(model.directory, path)
+        except IndexFileError as error:
+            raise EngineError(error.code, error.message, model=name) from error
+        printt("Added index %s to %s%s", target.name, name, " (replaced %s)" % ", ".join(replaced) if replaced else "")
+        rvc = getattr(self, "rvc", None)
+        if rvc is not None and name == self.settings.model_name and hasattr(rvc, "change_index"):
+            try:
+                rvc.change_index(str(target))
+            except Exception as error:  # a broken index must not break the stream
+                printt("Could not load the new index: %s", error)
+        self.reload_models()
+        self.status("index_added", name=name, index=target.name, replaced=replaced)
+        return {"index_file": target.name, "replaced": replaced}
+
     def reload_devices(self):
         if self.running:
             self.stop()
@@ -401,7 +447,11 @@ class RealtimeEngine:
             for key, value in coerced.items()
             if getattr(self.settings, key) != value
         }
+        if "model_name" in changed and self.can_hot_swap():
+            # Keep converting with the current voice while the new one loads.
+            self.begin_model_swap(changed.pop("model_name"))
         if not changed:
+            self.emit_state()
             return
         if self.running and "f0method" in changed:
             # The detector loads on first use inside the audio thread, where
@@ -425,6 +475,8 @@ class RealtimeEngine:
         self.emit_state()
 
     def apply_hot_settings(self, changed):
+        if "matched_fade" in changed and getattr(self, "splicer", None) is not None:
+            self.splicer.matched_fade = self.settings.matched_fade
         if not hasattr(self, "rvc"):
             return
         if "pitch" in changed:
@@ -475,6 +527,157 @@ class RealtimeEngine:
                 printt("Could not save model settings: %s", error)
         self.pending_model_settings_name = None
         self.model_settings_save_due = 0.0
+
+    # ------------------------------------------------------------------
+    # Hot model swap: change voices without stopping the stream
+    # ------------------------------------------------------------------
+    def can_hot_swap(self):
+        return (
+            self.running
+            and self.function == "vc"
+            and getattr(self, "rvc", None) is not None
+            and getattr(self.rvc, "net_g", None) is not None
+        )
+
+    def begin_model_swap(self, name):
+        """Load ``name``'s synthesizer (and index) on a worker thread.
+
+        The current voice keeps converting meanwhile; ``finish_model_swap``
+        hands the loaded model to the audio thread, which switches at a chunk
+        boundary together with the model's own settings.  A newer request
+        replaces one still loading.
+        """
+        self.flush_model_settings_save(force=True)
+        if self.model_swap is not None:
+            self.model_swap["cancelled"] = True
+        model = self.models_by_name[name]
+        job = {
+            "name": name,
+            "model": model,
+            "result": None,
+            "error": None,
+            "cancelled": False,
+            # Window geometry for a warm-up pass in the shape the stream uses.
+            "frames": self.input_wav_res.shape[0] // 160,
+            "skip_head": self.skip_head,
+            "return_length": self.return_length,
+        }
+        job["thread"] = threading.Thread(
+            target=self.load_swap_model, args=(job,), name="rvc-model-swap", daemon=True
+        )
+        self.model_swap = job
+        self.status("switching_model", name=name)
+        job["thread"].start()
+
+    def load_swap_model(self, job):
+        """Worker thread: build the new synthesizer without touching the stream."""
+        try:
+            model = job["model"]
+            values = load_model_settings(str(model.directory))
+            with side_gpu_work():
+                net_g, cpt = rvc_for_realtime.get_synthesizer(str(model.model_path), self.config.device)
+                net_g = net_g.half() if self.rvc.is_half else net_g.float()
+            net_g._rvc_cuda_graph_eager = True
+            with side_gpu_work():
+                # The first pass of a new model does one-time GPU setup (about
+                # 60 ms); do it here so the first live chunk is not late.
+                rvc_for_realtime.warm_synthesizer(
+                    net_g, cpt.get("version", "v1"), self.rvc.is_half, self.config.device,
+                    job["frames"], job["skip_head"], job["return_length"],
+                )
+                embedder = checkpoint_embedder(cpt)
+                embedder_model = self.rvc.embedders.get(embedder)
+                if embedder_model is None:
+                    embedder_model = load_hubert_model(
+                        self.config.device, self.rvc.is_half, embedder
+                    )
+                    embedder_model._rvc_cuda_graph_eager = True
+                    warm_embedder(
+                        embedder_model, cpt.get("version", "v1"), self.rvc.is_half,
+                        self.config.device, job["frames"] * 160,
+                    )
+            index = None
+            if values["index_rate"] > 0 and model.index_path is not None:
+                import faiss
+
+                loaded = faiss.read_index(str(model.index_path))
+                index = (loaded, loaded.reconstruct_n(0, loaded.ntotal))
+            job["result"] = {
+                "name": job["name"],
+                "net_g": net_g,
+                "pth_path": str(model.model_path),
+                "index_path": str(model.index_path) if model.index_path is not None else "",
+                "index": index,
+                "tgt_sr": cpt["config"][-1],
+                "if_f0": cpt.get("f0", 1),
+                "version": cpt.get("version", "v1"),
+                "embedder": embedder,
+                "embedder_model": embedder_model,
+                "settings": values,
+            }
+        except Exception as error:  # reported by finish_model_swap
+            traceback.print_exc()
+            job["error"] = error
+
+    def finish_model_swap(self):
+        """Command thread (tick): hand a loaded model over, or fall back."""
+        if self.swapped_model is not None:
+            name, self.swapped_model = self.swapped_model, None
+            save_settings(self.settings)
+            self.status("model_switched", name=name)
+            self.emit_state()
+        job = self.model_swap
+        if job is None or job["thread"].is_alive():
+            return
+        self.model_swap = None
+        if job["cancelled"]:
+            return
+        if job["error"] is not None:
+            self.emit("error", {"code": "model_load_failed", "message": str(job["error"])})
+            self.emit_state()
+            return
+        result = job["result"]
+        if not self.can_hot_swap():
+            # Stopped meanwhile: an ordinary change; the next start loads it.
+            self.update_settings({"model_name": result["name"]})
+            return
+        rvc = self.rvc
+        if result["tgt_sr"] != rvc.tgt_sr or result["if_f0"] != rvc.if_f0:
+            # A different sample rate or pitch mode needs new stream buffers.
+            printt("Switching to %s needs a restart (different sample rate or pitch mode)", result["name"])
+            self.stop()
+            self.update_settings({"model_name": result["name"]})
+            try:
+                self.start("vc")
+            except EngineError as error:
+                self.emit("error", {"code": error.code, "message": error.message})
+            return
+        self.pending_swap = result
+
+    def apply_model_swap(self, swap):
+        """Audio thread, between chunks: switch voice and per-model settings."""
+        rvc = self.rvc
+        rvc.net_g = swap["net_g"]
+        rvc.pth_path = swap["pth_path"]
+        rvc.version = swap["version"]
+        rvc.embedder = swap["embedder"]
+        rvc.model = rvc.embedders[swap["embedder"]] = swap["embedder_model"]
+        rvc.index_path = swap["index_path"]
+        if swap["index"] is not None:
+            rvc.index, rvc.big_npy = swap["index"]
+        elif hasattr(rvc, "index"):
+            del rvc.index
+        settings = self.settings
+        settings.model_name = swap["name"]
+        settings.__dict__.update(swap["settings"])
+        rvc.index_rate = settings.index_rate
+        rvc.change_key(settings.pitch)
+        rvc.change_formant(settings.formant)
+        rvc.change_protect(settings.protect)
+        if getattr(self, "loudness", None) is not None:
+            self.loudness.reset()  # a new voice, a new level
+        printt("Switched to %s without stopping", swap["name"])
+        self.swapped_model = swap["name"]
 
     # ------------------------------------------------------------------
     # Pitch matching (tools/pitch_match.py)
@@ -659,6 +862,7 @@ class RealtimeEngine:
         self.flush_model_settings_save()
         self.save_voice_pitch()
         self.finish_pitch_analysis()
+        self.finish_model_swap()
         self.log_underruns()
         if self.running and not self.streams_active():
             printt("Audio stream stopped unexpectedly; returning to the idle state.")
@@ -747,9 +951,7 @@ class RealtimeEngine:
             self.stop()
             raise EngineError("audio_start_failed", str(error)) from error
         if self.stream is not None:
-            stream_latency = self.stream.latency
-            if isinstance(stream_latency, (tuple, list)):
-                stream_latency = stream_latency[-1]
+            stream_latency = plausible_stream_latency(self.stream.latency)
             # Each emitted block lags the input by the fade plus the WSOLA
             # search span, minus the (usually small) splice offset.
             self.delay_time = (
@@ -873,6 +1075,11 @@ class RealtimeEngine:
             )
             self.rvc.change_protect(self.settings.protect)
             self.rvc.pitch_smoothing = self.settings.pitch_smoothing
+            # A model hot-swapped in ran without CUDA Graphs; a fresh start
+            # captures them as usual (prepare_inference warms them up).
+            for owner in (self.rvc.net_g, self.rvc.model):
+                if getattr(owner, "_rvc_cuda_graph_eager", False):
+                    owner._rvc_cuda_graph_eager = False
         except Exception as error:
             raise EngineError(
                 "model_load_failed",
@@ -889,6 +1096,8 @@ class RealtimeEngine:
         )
         self.block_frame_16k = 160 * self.block_frame // self.zc
         self.splicer = WsolaSplicer(self.samplerate, self.block_frame, self.config.device)
+        self.splicer.matched_fade = self.settings.matched_fade
+        self.splicer.warm()
         self.fade_frame = self.splicer.fade
         self.extra_frame = (
             int(np.round(self.settings.extra_time * self.samplerate / self.zc)) * self.zc
@@ -942,6 +1151,8 @@ class RealtimeEngine:
         if self.settings.hold_detector == "voice" and self.vad is None:
             printt("Silence detection: voice detection needs RNNoise at 48 kHz; using loudness")
         self.seam_confidences = []
+        # A swap handed over for a previous stream must not apply to this one.
+        self.pending_swap = None
         # Per-stream counters (see __init__).
         self.trimmed_frames = 0
         self.output_underruns = 0
@@ -1259,6 +1470,10 @@ class RealtimeEngine:
             # the next word is in it (pre-roll, see resume_from_hold).
             self.held_block = indata.copy() if self.pre_roll else None
             return self.hold_silence(start_time)
+        swap = self.pending_swap
+        if swap is not None:
+            self.pending_swap = None
+            self.apply_model_swap(swap)
         resumed = self.context_held
         if resumed:
             self.resume_from_hold()

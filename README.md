@@ -70,6 +70,7 @@ and copy its `assets/` folder (and any `models/` you want) into this checkout:
 ```text
 assets/
   hubert_base/      # Transformers-format HuBERT/ContentVec (config.json, pytorch_model.bin)
+  spin_v2/          # Optional, for SPIN v2 models (same format, from Applio's Hugging Face resources)
   rmvpe/rmvpe.pt
 ```
 

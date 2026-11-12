@@ -222,8 +222,19 @@ fn model_row<'a>(
     } else {
         fl!("library-rename")
     };
-    let controls = widget::row::with_capacity(4)
+    let index_tip = if model.index_file.is_some() {
+        fl!("library-replace-index")
+    } else {
+        fl!("library-add-index")
+    };
+    let controls = widget::row::with_capacity(5)
         .push(use_button)
+        .push(widget::tooltip(
+            widget::button::icon(widget::icon::from_name("list-add-symbolic"))
+                .on_press(Message::PickIndex(model.name.clone())),
+            widget::text::caption(index_tip),
+            widget::tooltip::Position::Top,
+        ))
         .push(widget::tooltip(
             widget::button::icon(widget::icon::from_name("document-edit-symbolic"))
                 .on_press_maybe((!in_use).then(|| Message::AskRenameModel(model.name.clone()))),

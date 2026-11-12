@@ -51,6 +51,7 @@ translate by `code`.
 | `reload_models` | | `null` |
 | `import_model` | `{"paths": ["/abs/Voice.pth", "/abs/added_Voice.index", …]}` | `{"models": ["Voice"]}`; copies each `.pth` (with matching `.index` files) into `models/<name>/` and selects the first |
 | `delete_model` | `{"name": "Voice"}` | `null`; moves `models/<name>/` to the desktop Trash (`gio trash`, recoverable) and selects another model if it was selected. Refused with `model_in_use` while converting with it |
+| `add_index` | `{"name": "Voice", "path": "/abs/added_Voice.index"}` | `{"index_file": "added_Voice.index", "replaced": [...]}`; copies the index into `models/<name>/`, moving any index it had to the Trash. Rejects `trained_*.index` (`index_trained`: RVC needs the `added_` one). Index rate is unchanged; a loaded model picks up the new file |
 | `rename_model` | `{"name": "Voice", "new_name": "Voice v2"}` | `null`; renames `models/<name>/` (settings go with it; the selection follows). Names must be unique (ignoring case), not start with `.`, and avoid `/ \ : * ? " < > \|`. Refused with `model_in_use` while converting with it |
 | `reload_devices` | | `null` |
 | `start` | `{"function": "vc" \| "passthrough"}` (default `vc`) | `null` |
@@ -75,7 +76,7 @@ translate by `code`.
 
 | Key | Type | Notes |
 | --- | --- | --- |
-| `model_name` | string | restart; must be a model name from state |
+| `model_name` | string | must be a model name from state. While converting, the new model loads in the background (status `switching_model`) and replaces the current one between two chunks together with its per-model settings (status `model_switched`), without stopping; it runs without CUDA Graphs until the next start (~3 ms more per chunk). A model with a different sample rate or pitch mode restarts the stream instead |
 | `gpu` | string | restart; `"auto"` or a GPU `id` from state |
 | `input_source` | `"microphone"` \| `"file"` | restart |
 | `input_device` / `output_device` | string | restart; a device `label` from state |
@@ -88,6 +89,7 @@ translate by `code`.
 | `loudness_target` | `"voice_chat"` \| `"streaming"` | live (default `"voice_chat"`): the output-level target, -21 or -16 LUFS (see [Output level](#output-level)) |
 | `rms_mix_rate` | number 0–1 | live (volume envelope) |
 | `f0method` | `"pm"` \| `"rmvpe"` \| `"fcpe"` | live |
+| `matched_fade` | bool | live (default on): hold the level through each crossfade between chunks, by how well the two chunks match below and above 4 kHz (`tools/splice.py`). No added latency. |
 | `pitch_smoothing` | bool | live (default on): Viterbi pitch tracking for RMVPE, the most likely continuous pitch path through each window instead of each 10 ms frame's own peak (restarts after unvoiced gaps; at most ~2.2 semitones of movement per frame). No added latency, about 3 ms of CPU per block |
 | `recording_folder` | string | live |
 | `recording_mode` | `"separate"` \| `"mix"` \| `"stereo"` | live (next recording) |
@@ -175,7 +177,8 @@ Front ends can re-render entirely from the latest state.
   "missing_assets": [],               // e.g. ["assets/rmvpe/rmvpe.pt"]
   "rnnoise": true,                    // input noise reduction uses RNNoise (else spectral gating)
   "voice_pitch": {"median_hz": 114.2, "seconds": 312.5, "needed_seconds": 20},
-  "analyzing_pitch": false            // analyze_source_pitch is running
+  "analyzing_pitch": false,           // analyze_source_pitch is running
+  "switching_model": null              // model loading for a hot swap, or null
 }
 ```
 
@@ -195,7 +198,7 @@ Front ends can re-render entirely from the latest state.
 | `error` | `{"code", "message"}`: a problem not tied to a request (e.g. `monitor_failed`, `file_error`) |
 | `log` | `{"text": "…"}`: engine stdout/stderr as it is written |
 
-Status codes: `importing_model`, `model_imported` (`names`), `model_deleted` (`name`), `model_renamed` (`name`, `new_name`), `preparing`, `loading_model`, `preparing_inference`,
+Status codes: `importing_model`, `model_imported` (`names`), `model_deleted` (`name`), `model_renamed` (`name`, `new_name`), `index_added` (`name`, `index`, `replaced`), `switching_model` (`name`), `model_switched` (`name`), `preparing`, `loading_model`, `preparing_inference`,
 `starting_audio`, `conversion_started`, `passthrough_started`,
 `conversion_stopped`, `passthrough_stopped`, `settings_changed`,
 `stream_stopped` (the audio device went away), `file_selected` (`name`),
@@ -212,4 +215,5 @@ Status codes: `importing_model`, `model_imported` (`names`), `model_deleted` (`n
 `recording_failed`, `assets_missing` (details: `paths`), `model_load_failed`, `import_no_model_file`, `import_failed`, `file_error`, `monitor_failed`, `log_save_failed`,
 `pitch_analysis_busy`, `pitch_analysis_failed`, `no_voice_found`,
 `model_in_use`, `delete_failed`, `bad_model_name` (details: `reason`),
-`model_name_taken`, `rename_failed`.
+`model_name_taken`, `rename_failed`, `index_trained`, `index_not_index`,
+`index_missing_file`, `index_copy_failed`.

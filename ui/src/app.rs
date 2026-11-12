@@ -187,6 +187,7 @@ pub enum Toggle {
     OutputDenoise,
     HoldContext,
     PitchSmoothing,
+    MatchedFade,
 }
 
 impl Toggle {
@@ -196,6 +197,7 @@ impl Toggle {
             Toggle::OutputDenoise => "output_denoise",
             Toggle::HoldContext => "hold_context",
             Toggle::PitchSmoothing => "pitch_smoothing",
+            Toggle::MatchedFade => "matched_fade",
         }
     }
 }
@@ -292,6 +294,9 @@ pub enum Message {
     RenameInput(String),
     ConfirmRenameModel,
     CancelRenameModel,
+    /// Choose an .index file for a model (adding or replacing its index).
+    PickIndex(String),
+    IndexPicked(String, Option<String>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -669,6 +674,18 @@ impl cosmic::Application for App {
                 if self.engine.is_none() || self.state.is_none() {
                     return self.toast(fl!("error-not-ready"));
                 }
+                // A lone .index (no .pth) is attached to the selected model.
+                if paths.iter().all(|path| is_index_file(path)) {
+                    let Some(model) = self.state.as_ref().map(|s| s.settings.model_name.clone())
+                    else {
+                        return Task::none();
+                    };
+                    if paths.len() != 1 {
+                        return self.toast(fl!("error-index-one-file"));
+                    }
+                    self.send("add_index", json!({"name": model, "path": paths[0]}));
+                    return Task::none();
+                }
                 // Model files are imported; anything else is a voice clip
                 // (or folder of clips) for the selected model's pitch.
                 if !paths.iter().any(|path| is_model_file(path)) {
@@ -733,6 +750,11 @@ impl cosmic::Application for App {
                 }
             }
             Message::CancelRenameModel => self.renaming = None,
+            Message::PickIndex(name) => return pick_index(name, fl!("pick-index")),
+            Message::IndexPicked(_, None) => {}
+            Message::IndexPicked(name, Some(path)) => {
+                self.send("add_index", json!({"name": name, "path": path}));
+            }
             Message::ConfirmRenameModel => {
                 if let Some((name, new_name)) = self.renaming.take() {
                     let new_name = new_name.trim().to_string();
@@ -954,6 +976,7 @@ impl App {
                         | "pitch_analyzed"
                         | "model_deleted"
                         | "model_renamed"
+                        | "index_added"
                 ) {
                     return self.toast(self.status.clone());
                 }
@@ -1041,6 +1064,26 @@ fn pick_clips(title: String) -> Task<Message> {
     })
 }
 
+fn pick_index(model: String, title: String) -> Task<Message> {
+    let filter_name = fl!("index-filter");
+    cosmic::task::future(async move {
+        let dialog = file_chooser::open::Dialog::new()
+            .title(title)
+            .filter(file_chooser::FileFilter::new(&filter_name).glob("*.index"));
+        let path = dialog
+            .open_file()
+            .await
+            .ok()
+            .and_then(|response| response.url().to_file_path().ok())
+            .map(|path| path.to_string_lossy().into_owned());
+        Message::IndexPicked(model, path)
+    })
+}
+
+fn is_index_file(path: &str) -> bool {
+    path.to_lowercase().ends_with(".index")
+}
+
 /// `.pth` models and their `.index` files are imported; other drops are clips.
 fn is_model_file(path: &str) -> bool {
     let lower = path.to_lowercase();
@@ -1102,6 +1145,19 @@ pub fn status_text(code: &str, data: &Value) -> String {
         "recording_started" => fl!("status-recording-started"),
         "importing_model" => fl!("status-importing-model"),
         "model_deleted" => fl!("status-model-deleted", name = text("name")),
+        "switching_model" => fl!("status-switching-model", name = text("name")),
+        "model_switched" => fl!("status-model-switched", name = text("name")),
+        "index_added" => {
+            let replaced = data
+                .get("replaced")
+                .and_then(Value::as_array)
+                .is_some_and(|list| !list.is_empty());
+            if replaced {
+                fl!("status-index-replaced", name = text("name"), index = text("index"))
+            } else {
+                fl!("status-index-added", name = text("name"), index = text("index"))
+            }
+        }
         "model_renamed" => fl!(
             "status-model-renamed",
             name = text("name"),
@@ -1155,6 +1211,9 @@ pub fn error_text(error: &ErrorInfo) -> String {
         "model_in_use" => fl!("error-model-in-use"),
         "delete_failed" => fl!("error-delete-failed", detail = error.message.clone()),
         "model_name_taken" => fl!("error-model-name-taken"),
+        "index_trained" => fl!("error-index-trained"),
+        "index_not_index" | "index_missing_file" => fl!("error-index-not-index"),
+        "index_copy_failed" => fl!("error-index-copy-failed", detail = error.message.clone()),
         "bad_model_name" => fl!("error-bad-model-name"),
         "rename_failed" => fl!("error-rename-failed", detail = error.message.clone()),
         "pitch_analysis_busy" => fl!("error-pitch-analysis-busy"),
@@ -1167,7 +1226,7 @@ pub fn error_text(error: &ErrorInfo) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Num, is_model_file, recommended_shift};
+    use super::{Num, is_index_file, is_model_file, recommended_shift};
 
     #[test]
     fn recommends_the_shift_onto_the_source_median_in_tenths() {
@@ -1186,6 +1245,8 @@ mod tests {
         assert!(is_model_file("/a/added_Voice.index"));
         assert!(!is_model_file("/a/dataset.wav"));
         assert!(!is_model_file("/a/dataset-folder"));
+        assert!(is_index_file("/a/added_Voice.INDEX"));
+        assert!(!is_index_file("/a/Voice.pth"));
     }
 
     #[test]

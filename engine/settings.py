@@ -75,6 +75,8 @@ class EngineSettings:
     #: Freeze the model's past context during silence (see engine/core.py).
     hold_context: bool = True
     hold_detector: str = "level"
+    #: Hold the level through each crossfade (tools/splice.py).
+    matched_fade: bool = True
     #: What the output-level indicator aims for: voice chat (-21 LUFS) or
     #: streaming (-16 LUFS).
     loudness_target: str = "voice_chat"
@@ -137,6 +139,7 @@ PERFORMANCE_DEFAULT_KEYS = (
     "output_denoise",
     "hold_context",
     "hold_detector",
+    "matched_fade",
     "rms_mix_rate",
     "f0method",
     "pitch_smoothing",

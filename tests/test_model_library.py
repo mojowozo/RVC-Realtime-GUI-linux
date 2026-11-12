@@ -59,7 +59,10 @@ class ModelFolders(unittest.TestCase):
         engine = core.RealtimeEngine.__new__(core.RealtimeEngine)
         engine.settings = EngineSettings(model_name=selected)
         engine.devices = SimpleNamespace(
-            resolve=lambda value, kind: value, resolve_monitor=lambda value: value
+            resolve=lambda value, kind: value,
+            resolve_monitor=lambda value: value,
+            inputs={},
+            outputs={},
         )
         engine.gpu_options = [{"id": "auto", "label": None}]
         engine.pending_model_settings_name = None

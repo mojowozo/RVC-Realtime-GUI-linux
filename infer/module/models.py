@@ -12,6 +12,7 @@ from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 from infer.module import attentions, commons, modules
 from infer.module.commons import get_padding, init_weights
+from infer.module.refinegan import RefineGANGenerator
 
 class TextEncoder(nn.Module):
     def __init__(
@@ -609,18 +610,26 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
             kernel_size,
             float(p_dropout),
         )
-        self.dec = GeneratorNSF(
-            inter_channels,
-            resblock,
-            resblock_kernel_sizes,
-            resblock_dilation_sizes,
-            upsample_rates,
-            upsample_initial_channel,
-            upsample_kernel_sizes,
-            gin_channels=gin_channels,
-            sr=sr,
-            is_half=kwargs["is_half"],
-        )
+        if kwargs.get("vocoder", "HiFi-GAN") == "RefineGAN":
+            self.dec = RefineGANGenerator(
+                sample_rate=sr,
+                upsample_rates=upsample_rates,
+                num_mels=inter_channels,
+                gin_channels=gin_channels,
+            )
+        else:
+            self.dec = GeneratorNSF(
+                inter_channels,
+                resblock,
+                resblock_kernel_sizes,
+                resblock_dilation_sizes,
+                upsample_rates,
+                upsample_initial_channel,
+                upsample_kernel_sizes,
+                gin_channels=gin_channels,
+                sr=sr,
+                is_half=kwargs["is_half"],
+            )
         self.enc_q = PosteriorEncoder(
             spec_channels,
             inter_channels,

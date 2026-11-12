@@ -26,6 +26,7 @@ class FrameStampingSynth:
     def infer(self, phone, lengths, pitch, nsff0, sid, skip_head, return_length, return_length2,
               noise=None, source_noise=None, phase0=None):
         self.calls.append((skip_head, return_length, return_length2, source_noise.shape[0]))
+        self.phase0 = float(phase0)
         frames = torch.arange(skip_head, skip_head + return_length2, dtype=torch.float32)
         return (frames.repeat_interleave(UPP)[None, None, :],)
 
@@ -91,14 +92,24 @@ class DecoderContextTest(unittest.TestCase):
         self.assertEqual(rvc.net_g.calls[-1][:3], (0, 25, 25))
         self.assertEqual(float(audio[0]), 5.0)
 
-    def test_carried_phase_advances_from_the_decoded_start(self):
-        # 150 Hz for 14 frames from the decoded start: the phase carried to
-        # the next chunk is the decoded start's phase plus that advance.
+    def test_carried_phase_advances_from_the_returned_start(self):
+        # 150 Hz for 14 frames from the first returned sample: the phase carried
+        # to the next chunk is that sample's phase plus that advance.
         rvc = stub_rvc()
         with mock.patch.object(rtrvc, "DECODER_CONTEXT_FRAMES", 8):
             run(rvc, block_frames=14)
         expected = (150.0 * 14 * UPP / TGT_SR) % 1.0
         self.assertAlmostEqual(rvc.phase_start, expected, places=5)
+
+    def test_decoder_starts_early_enough_to_reach_the_carried_phase(self):
+        # The decoded window starts 8 frames before the returned one, so its
+        # phase is the carried phase minus those frames' advance.
+        rvc = stub_rvc()
+        rvc.phase_start = 0.25
+        with mock.patch.object(rtrvc, "DECODER_CONTEXT_FRAMES", 8):
+            run(rvc)
+        expected = (0.25 - 150.0 * 8 * UPP / TGT_SR) % 1.0
+        self.assertAlmostEqual(rvc.net_g.phase0, expected, places=5)
 
     def test_default_is_80_ms(self):
         self.assertEqual(rtrvc.DECODER_CONTEXT_FRAMES, 8)

@@ -76,6 +76,8 @@ pub struct Settings {
     pub hold_context: bool,
     #[serde(default = "default_hold_detector")]
     pub hold_detector: String,
+    #[serde(default = "default_true")]
+    pub matched_fade: bool,
     /// Output-level target: `"voice_chat"` (-21 LUFS) or `"streaming"` (-16).
     #[serde(default = "default_loudness_target")]
     pub loudness_target: String,

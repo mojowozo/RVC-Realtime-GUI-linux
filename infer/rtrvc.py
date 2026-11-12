@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torchaudio.transforms import Resample
 
 from engine.assets import RMVPE_PATH
-from infer.hubert import extract_hubert_features, load_hubert_model
+from infer.hubert import checkpoint_embedder, extract_hubert_features, load_hubert_model
 from tools.cuda_graph import run_cuda_graph
 
 
@@ -68,6 +68,10 @@ CHUNK_CONSISTENCY = True
 DECODER_CONTEXT_FRAMES = 8
 
 
+#: Decoders this app can run; ``vocoder`` in a checkpoint, HiFi-GAN if absent.
+SUPPORTED_VOCODERS = ("HiFi-GAN", "RefineGAN")
+
+
 def fill_short_gaps(f0, max_gap=None):
     """Bridge brief unvoiced dropouts inside voiced speech; keep the rest unvoiced.
 
@@ -103,6 +107,42 @@ def fill_short_gaps(f0, max_gap=None):
 #: RVC's "protect" default.  On unvoiced frames (consonants, breaths) only this
 #: share of the index-blended features is used; 0.5 turns protection off.
 DEFAULT_PROTECT = 0.33
+
+
+def warm_synthesizer(net_g, version, is_half, device, frames, skip_head, return_length):
+    """Run one throwaway decoding pass shaped like the stream's chunks."""
+    device = torch.device(device)
+    margin = min(DECODER_CONTEXT_FRAMES, skip_head)
+    dtype = torch.float16 if is_half else torch.float32
+    channels = 768 if version == "v2" else 256
+    with torch.no_grad():
+        phone = torch.zeros(1, frames, channels, device=device, dtype=dtype)
+        pitch = torch.full((1, frames), 60, device=device, dtype=torch.long)
+        pitchf = torch.full((1, frames), 150.0, device=device)
+        head, length = skip_head - margin, return_length + margin
+        extra = {}
+        if CHUNK_CONSISTENCY:
+            # The same optional inputs a live chunk passes (time-aligned noise
+            # and carried phase), so their one-time setup happens here too.
+            flow_head = max(head - 24, 0)
+            extra = dict(
+                noise=torch.randn(1, net_g.inter_channels, frames - flow_head, device=device),
+                source_noise=torch.randn(length * net_g.dec.upp, device=device),
+                phase0=torch.zeros(1, device=device),
+            )
+        net_g.infer(
+            phone,
+            torch.LongTensor([frames]).to(device),
+            pitch,
+            pitchf,
+            torch.LongTensor([0]).to(device),
+            head,
+            length,
+            length,
+            **extra,
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
 
 def newest_input_f0(f0, shift, key):
@@ -145,18 +185,26 @@ def get_synthesizer(pth_path, device=torch.device("cpu")):
     cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
     if_f0 = cpt.get("f0", 1)
     version = cpt.get("version", "v1")
+    vocoder = cpt.get("vocoder") or "HiFi-GAN"
+    if vocoder not in SUPPORTED_VOCODERS or (vocoder != "HiFi-GAN" and if_f0 != 1):
+        raise ValueError(f"This model uses the unsupported {vocoder} vocoder.")
     if version == "v1":
         if if_f0 == 1:
-            net_g = SynthesizerTrnMs256NSFsid(*cpt["config"], is_half=False)
+            net_g = SynthesizerTrnMs256NSFsid(*cpt["config"], is_half=False, vocoder=vocoder)
         else:
             net_g = SynthesizerTrnMs256NSFsid_nono(*cpt["config"])
     elif version == "v2":
         if if_f0 == 1:
-            net_g = SynthesizerTrnMs768NSFsid(*cpt["config"], is_half=False)
+            net_g = SynthesizerTrnMs768NSFsid(*cpt["config"], is_half=False, vocoder=vocoder)
         else:
             net_g = SynthesizerTrnMs768NSFsid_nono(*cpt["config"])
     del net_g.enc_q
-    net_g.load_state_dict(cpt["weight"], strict=False)
+    loaded = net_g.load_state_dict(cpt["weight"], strict=False)
+    mismatched = [
+        key for key in loaded.missing_keys + loaded.unexpected_keys if key.startswith("dec.")
+    ]
+    if mismatched:
+        raise ValueError(f"This model's {vocoder} decoder does not match: {mismatched[:3]}")
     net_g = net_g.float()
     net_g.eval().to(device)
     net_g.remove_weight_norm()
@@ -216,11 +264,6 @@ class RVC:
 
             self.resample_kernel = {}
 
-            if last_rvc is None:
-                self.model = load_hubert_model(self.device, self.is_half)
-            else:
-                self.model = last_rvc.model
-
             self.net_g = None
 
             def set_synthesizer():
@@ -229,6 +272,7 @@ class RVC:
                 cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
                 self.if_f0 = cpt.get("f0", 1)
                 self.version = cpt.get("version", "v1")
+                self.embedder = checkpoint_embedder(cpt)
                 if self.is_half:
                     self.net_g = self.net_g.half()
                 else:
@@ -240,8 +284,18 @@ class RVC:
                 self.tgt_sr = last_rvc.tgt_sr
                 self.if_f0 = last_rvc.if_f0
                 self.version = last_rvc.version
+                self.embedder = last_rvc.embedder
                 self.is_half = last_rvc.is_half
                 self.net_g = last_rvc.net_g
+
+            #: Loaded embedders by name.  Each model needs its own one, and
+            #: reloading takes seconds, so they stay loaded once used.
+            self.embedders = {} if last_rvc is None else last_rvc.embedders
+            if self.embedder not in self.embedders:
+                self.embedders[self.embedder] = load_hubert_model(
+                    self.device, self.is_half, self.embedder
+                )
+            self.model = self.embedders[self.embedder]
 
             if last_rvc is not None and hasattr(last_rvc, "model_rmvpe"):
                 self.model_rmvpe = last_rvc.model_rmvpe
@@ -295,6 +349,14 @@ class RVC:
 
     def change_formant(self, new_formant):
         self.formant_shift = new_formant
+
+    def change_index(self, index_path):
+        """Use a new .index file (added to the model while it is loaded)."""
+        self.index_path = index_path
+        if self.index_rate != 0:
+            self.index = faiss.read_index(index_path)
+            self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
+            printt("Index search enabled")
 
     def change_index_rate(self, new_index_rate):
         if new_index_rate != 0 and self.index_rate == 0:
@@ -513,7 +575,16 @@ class RVC:
             samples = return_length_value * upp
             if self.source_noise is None or self.source_noise.shape[0] != samples:
                 self.source_noise = torch.randn(samples, device=self.device)
-            phase0 = torch.tensor([self.phase_start], device=self.device, dtype=torch.float32)
+            # phase_start belongs to the first returned sample, where the splice
+            # is.  Pitch is re-estimated every chunk, so carrying it from the
+            # decoded window's start would add those revisions up across the
+            # context frames: agreement in the overlap went from 0.59 to 0.67 on
+            # RefineGAN and 0.52 to 0.57 on HiFi-GAN by anchoring it here.
+            lead = cache_pitchf[0, skip_head_value : skip_head_value + margin].sum().item()
+            lead *= upp / self.tgt_sr
+            phase0 = torch.tensor(
+                [(self.phase_start - lead) % 1.0], device=self.device, dtype=torch.float32
+            )
         with torch.no_grad():
             if aligned_source:
                 infered_audio = run_cuda_graph(
@@ -544,7 +615,8 @@ class RVC:
                 )
                 # Phase at the next chunk's first sample: this chunk's phase
                 # after the frames the window is about to advance by.
-                advance = cache_pitchf[0, skip_head_value : skip_head_value + shift].sum()
+                first = skip_head_value + margin
+                advance = cache_pitchf[0, first : first + shift].sum()
                 self.phase_start = float(
                     (self.phase_start + advance.item() * upp / self.tgt_sr) % 1.0
                 )

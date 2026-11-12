@@ -191,6 +191,7 @@ pub fn mmss(seconds: f64) -> String {
 
 fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let selected = state.settings.model_name.as_str();
+    let selected_model = state.models.iter().find(|model| model.name == selected);
     let files = state
         .models
         .iter()
@@ -232,6 +233,16 @@ fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             .add(
                 widget::row::with_capacity(4)
                     .push(widget::text::caption(files).width(Length::Fill))
+                    .push(
+                        widget::button::standard(if selected_model.is_some_and(|m| m.index_file.is_some()) {
+                            fl!("replace-index")
+                        } else {
+                            fl!("add-index")
+                        })
+                        .on_press_maybe(
+                            selected_model.map(|m| Message::PickIndex(m.name.clone())),
+                        ),
+                    )
                     .push(
                         widget::button::standard(fl!("page-library"))
                             .leading_icon(widget::icon::from_name("view-list-symbolic"))
@@ -668,6 +679,13 @@ fn performance_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> 
                             .position(|detector| *detector == settings_.hold_detector),
                         Message::SelectHoldDetector,
                     )),
+            )
+            .add(
+                settings::item::builder(fl!("matched-fade"))
+                    .description(fl!("matched-fade-detail"))
+                    .toggler(settings_.matched_fade, |value| {
+                        Message::Toggle(Toggle::MatchedFade, value)
+                    }),
             )
             .into(),
         settings::section()

@@ -214,6 +214,9 @@ class EngineServer:
             "reset_settings": lambda args: engine.reset_settings(require(args, "group", str)),
             "reload_models": lambda args: engine.reload_models(),
             "delete_model": lambda args: engine.delete_model(require(args, "name", str)),
+            "add_index": lambda args: engine.add_index(
+                require(args, "name", str), require(args, "path", str)
+            ),
             "rename_model": lambda args: engine.rename_model(
                 require(args, "name", str), require(args, "new_name", str)
             ),

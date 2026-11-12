@@ -2,7 +2,7 @@ app-title = RVC Realtime
 
 ## Drag and drop
 drop-title = Drop to add models or measure a voice
-drop-detail = Each .pth becomes a model; drop its .index file along with it. Drop audio clips or a folder of them to measure the selected model's voice pitch.
+drop-detail = Each .pth becomes a model; drop its .index file along with it. An .index on its own is added to the selected model. Drop audio clips or a folder of them to measure the selected model's voice pitch.
 model-imported = Added model: { $names }
 
 ## Typed values
@@ -81,6 +81,8 @@ delete-model-body = { $name } and its saved settings (pitch, gains) will be move
 delete-model-confirm = Move to Trash
 cancel = Cancel
 status-model-deleted = Moved { $name } to the Trash
+status-switching-model = Loading { $name }… (still converting with the current voice)
+status-model-switched = Switched to { $name }
 error-model-in-use = Stop converting before deleting this model.
 error-delete-failed = Could not move the model to the Trash: { $detail }
 library-rename = Rename
@@ -92,6 +94,18 @@ status-model-renamed = Renamed { $name } to { $new_name }
 error-model-name-taken = Another model already has that name.
 error-bad-model-name = That name can't be used: it can't be empty, start with a dot, or contain / \ : * ? " < > |
 error-rename-failed = Could not rename the model: { $detail }
+add-index = Add index…
+replace-index = Replace index…
+library-add-index = Add an .index file
+library-replace-index = Replace the .index file (the old one goes to the Trash)
+pick-index = Choose the model's .index file
+index-filter = RVC index (*.index)
+status-index-added = Added { $index } to { $name }. Index rate is unchanged.
+status-index-replaced = Replaced the index of { $name } with { $index }; the old one is in the Trash.
+error-index-one-file = Drop one .index file at a time.
+error-index-trained = That's the trained_ index, which RVC can't use. Pick the added_ index from the same folder.
+error-index-not-index = That isn't an .index file.
+error-index-copy-failed = Could not add the index: { $detail }
 formant = Formant
 formant-detail = Shifts the voice's resonance, how big the speaker sounds, without changing pitch. Higher sounds smaller and brighter, lower sounds bigger and deeper. 0 keeps the model's own.
 index-rate = Index rate
@@ -155,6 +169,8 @@ volume-envelope-detail = How closely the converted voice's loudness follows your
 gpu = GPU
 gpu-detail = The graphics card that runs the model. Changing it restarts conversion.
 gpu-automatic = Automatic (recommended)
+matched-fade = Match level across seams
+matched-fade-detail = Keeps the level steady where one chunk joins the next, mostly in the highs. Takes effect right away, so you can compare it while speaking. No added delay.
 hold-context = Hold context during silence
 hold-context-detail = Keeps the model's memory of your last words while you're quiet, so the first word after a pause isn't slurred.
 input-denoise-rnnoise = Removes background noise like keyboards, fans and traffic from your mic before conversion. Uses RNNoise; adds 20 ms of delay.

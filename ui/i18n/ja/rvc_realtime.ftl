@@ -2,7 +2,7 @@ app-title = RVC リアルタイム
 
 ## Drag and drop
 drop-title = ドロップしてモデルを追加、または声を測定
-drop-detail = .pth ごとに1つのモデルになります。.index も一緒にドロップしてください。音声クリップやそのフォルダーをドロップすると、選択中のモデルの声のピッチを測定します。
+drop-detail = .pth ごとに1つのモデルになります。.index も一緒にドロップしてください。.index だけをドロップすると、選択中のモデルに追加されます。音声クリップやそのフォルダーをドロップすると、選択中のモデルの声のピッチを測定します。
 model-imported = モデルを追加しました: { $names }
 
 ## Typed values
@@ -81,6 +81,8 @@ delete-model-body = { $name } と保存された設定（ピッチ、ゲイン�
 delete-model-confirm = ゴミ箱へ移動
 cancel = キャンセル
 status-model-deleted = { $name } をゴミ箱へ移動しました
+status-switching-model = { $name } を読み込み中…（現在の声で変換を続けています）
+status-model-switched = { $name } に切り替えました
 error-model-in-use = このモデルを削除する前に変換を停止してください。
 error-delete-failed = モデルをゴミ箱へ移動できませんでした: { $detail }
 library-rename = 名前を変更
@@ -92,6 +94,18 @@ status-model-renamed = { $name } を { $new_name } に変更しました
 error-model-name-taken = その名前のモデルはすでにあります。
 error-bad-model-name = その名前は使えません。空の名前、ドットで始まる名前、/ \ : * ? " < > | を含む名前は使えません。
 error-rename-failed = モデルの名前を変更できませんでした: { $detail }
+add-index = インデックスを追加…
+replace-index = インデックスを置き換え…
+library-add-index = .index ファイルを追加
+library-replace-index = .index ファイルを置き換え（古いものはゴミ箱へ）
+pick-index = モデルの .index ファイルを選択
+index-filter = RVC インデックス (*.index)
+status-index-added = { $name } に { $index } を追加しました。インデックス使用率は変わりません。
+status-index-replaced = { $name } のインデックスを { $index } に置き換えました。古いものはゴミ箱にあります。
+error-index-one-file = .index ファイルは 1 つずつドロップしてください。
+error-index-trained = それは RVC で使えない trained_ インデックスです。同じフォルダーの added_ インデックスを選んでください。
+error-index-not-index = .index ファイルではありません。
+error-index-copy-failed = インデックスを追加できませんでした: { $detail }
 formant = フォルマント
 formant-detail = ピッチを変えずに声の響き（話者の体格の印象）を変えます。上げると小柄で明るく、下げると大柄で太く聞こえます。0 はモデル本来の響きです。
 index-rate = インデックス使用率
@@ -155,6 +169,8 @@ volume-envelope-detail = 変換後の声の大きさを、瞬間ごとにどれ�
 gpu = 使用GPU
 gpu-detail = モデルを実行するグラフィックカードです。変更すると変換が再起動します。
 gpu-automatic = 自動（推奨）
+matched-fade = つなぎ目の音量を補正
+matched-fade-detail = チャンクのつなぎ目で、主に高音域の音量を一定に保ちます。すぐに反映されるので、話しながら比較できます。遅延は増えません。
 hold-context = 無音中はコンテキストを保持
 hold-context-detail = 黙っている間も直前の発話をモデルの文脈として保持し、間の後の最初の言葉が不明瞭になるのを防ぎます。
 input-denoise-rnnoise = 変換前にマイクのキーボード音、ファン、車の音などの雑音を除去します。RNNoise を使用し、遅延が 20 ms 増えます。

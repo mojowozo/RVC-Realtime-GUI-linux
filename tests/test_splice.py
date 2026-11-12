@@ -3,7 +3,9 @@ import unittest
 
 import torch
 
-from tools.splice import CONFIDENCE_THRESHOLD, WsolaSplicer
+from engine.core import RealtimeEngine
+from engine.settings import PERFORMANCE_DEFAULT_KEYS, EngineSettings
+from tools.splice import CONFIDENCE_THRESHOLD, MAX_FADE_GAIN, WsolaSplicer
 
 RATE = 48000
 BLOCK = 12000  # 0.25 s
@@ -108,6 +110,101 @@ class WsolaSplicerTest(unittest.TestCase):
         self.splicer.reset()
         self.assertEqual(float(self.splicer.template.abs().max()), 0.0)
         self.assertEqual(self.splicer.last_offset, 0)
+
+
+class MatchedFadeTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        self.splicer = WsolaSplicer(RATE, BLOCK, torch.device("cpu"))
+        self.fade = self.splicer.fade
+
+    def noise(self, band=None):
+        """White noise, or noise limited to the low or high band."""
+        audio = torch.randn(self.fade) * 0.1
+        if band is None:
+            return audio
+        spectrum = torch.fft.rfft(audio)
+        keep = self.splicer.low_bins if band == "low" else ~self.splicer.low_bins
+        return torch.fft.irfft(spectrum * keep, n=self.fade)
+
+    def mid_power(self, audio):
+        quarter = self.fade // 4
+        return torch.mean(audio[quarter : -quarter] ** 2).item()
+
+    def faded(self, template, head):
+        self.splicer.template[:] = template
+        return self.splicer.crossfade(head)
+
+    def test_identical_audio_passes_through(self):
+        audio = self.noise()
+        self.assertTrue(torch.allclose(self.faded(audio, audio), audio, atol=1e-4))
+
+    def test_unrelated_audio_keeps_its_level(self):
+        template, head = self.noise(), self.noise()
+        self.splicer.matched_fade = False
+        plain = self.mid_power(self.faded(template, head))
+        self.splicer.matched_fade = True
+        matched = self.mid_power(self.faded(template, head))
+        target = self.mid_power(head)
+        self.assertLess(plain, 0.8 * target)
+        self.assertGreater(matched, 0.9 * target)
+
+    def test_bands_are_judged_separately(self):
+        shared = self.noise("low")
+        template = shared + self.noise("high")
+        head = shared + self.noise("high")
+        self.splicer.template[:] = template
+        low_gain, high_gain = self.splicer.fade_gains(head)
+        middle = self.fade // 2
+        self.assertLess(low_gain[middle].item(), 1.05)
+        self.assertGreater(high_gain[middle].item(), 1.2)
+
+    def test_gains_vanish_at_the_ends_of_the_fade(self):
+        self.splicer.template[:] = self.noise()
+        for gain in self.splicer.fade_gains(self.noise()):
+            self.assertAlmostEqual(gain[0].item(), 1.0, places=2)
+            self.assertAlmostEqual(gain[-1].item(), 1.0, places=2)
+            self.assertLessEqual(gain.max().item(), MAX_FADE_GAIN)
+
+    def test_fading_in_from_silence_is_not_lifted(self):
+        self.splicer.template.zero_()
+        head = self.noise()
+        expected = head * self.splicer.fade_in
+        self.assertTrue(torch.allclose(self.splicer.crossfade(head), expected, atol=1e-4))
+
+    def test_a_louder_chunk_with_the_same_waveform_is_not_lifted(self):
+        # A word starting: the level changes, but nothing is mismatched.
+        audio = self.noise()
+        self.splicer.template[:] = audio
+        for gain in self.splicer.fade_gains(audio * 4):
+            self.assertLess(gain.max().item(), 1.01)
+
+    def test_warming_leaves_the_splicer_unchanged(self):
+        self.splicer.template[:] = 0
+        self.splicer.warm()
+        self.assertEqual(float(self.splicer.template.abs().sum()), 0.0)
+
+    def test_fading_out_to_silence_is_not_lifted(self):
+        template = self.noise()
+        self.splicer.template[:] = template
+        faded = self.splicer.crossfade(torch.zeros(self.fade))
+        expected = template * self.splicer.fade_out
+        self.assertTrue(torch.allclose(faded, expected, atol=1e-4))
+
+
+
+
+class MatchedFadeSettingTest(unittest.TestCase):
+    def test_it_is_on_by_default_and_resets_with_performance_settings(self):
+        self.assertTrue(EngineSettings().matched_fade)
+        self.assertIn("matched_fade", PERFORMANCE_DEFAULT_KEYS)
+
+    def test_changing_it_reaches_the_running_splicer(self):
+        engine = RealtimeEngine.__new__(RealtimeEngine)
+        engine.settings = EngineSettings(matched_fade=False)
+        engine.splicer = WsolaSplicer(RATE, BLOCK, torch.device("cpu"))
+        engine.apply_hot_settings({"matched_fade": False})
+        self.assertFalse(engine.splicer.matched_fade)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,20 @@ class HubertModelWithFinalProj(HubertModel):
         self.final_proj = nn.Linear(config.hidden_size, config.classifier_proj_size)
 
 HUBERT_MODEL_PATH = (PROJECT_ROOT / "assets" / "hubert_base").resolve()
+#: Embedders in the same Transformers HuBERT format, by the name checkpoints
+#: store in ``embedder_model``.  A model must run on the one it was trained with.
+EMBEDDER_PATHS = {
+    "contentvec": HUBERT_MODEL_PATH,
+    "spin-v2": (PROJECT_ROOT / "assets" / "spin_v2").resolve(),
+}
+
+
+def checkpoint_embedder(cpt):
+    """The embedder a checkpoint was trained with; older ones have no field."""
+    name = cpt.get("embedder_model") or "contentvec"
+    if name not in EMBEDDER_PATHS:
+        raise ValueError(f"This model uses the unsupported {name} embedder.")
+    return name
 
 
 def _device_type(device):
@@ -28,12 +42,11 @@ def _device_type(device):
     return str(device).split(":", 1)[0]
 
 
-def load_hubert_model(device, is_half=False):
-    """Load the local Transformers HuBERT/ContentVec model for RVC."""
-    if not (HUBERT_MODEL_PATH / "config.json").is_file():
-        raise FileNotFoundError(
-            f"Transformers HuBERT model not found: {HUBERT_MODEL_PATH}"
-        )
+def load_hubert_model(device, is_half=False, embedder="contentvec"):
+    """Load a local Transformers HuBERT-format embedder for RVC."""
+    path = EMBEDDER_PATHS[embedder]
+    if not (path / "config.json").is_file():
+        raise FileNotFoundError(f"Transformers HuBERT model not found: {path}")
 
     dtype = torch.float16 if is_half else torch.float32
     load_options = {
@@ -46,13 +59,11 @@ def load_hubert_model(device, is_half=False):
 
     logger.info(
         "Loading Transformers HuBERT from %s (%s on %s)",
-        HUBERT_MODEL_PATH,
+        path,
         dtype,
         device,
     )
-    model = HubertModelWithFinalProj.from_pretrained(
-        str(HUBERT_MODEL_PATH), **load_options
-    )
+    model = HubertModelWithFinalProj.from_pretrained(str(path), **load_options)
     model = model.to(device)
     return model.eval()
 
@@ -63,6 +74,14 @@ def hubert_audio_requires_normalization():
         str(HUBERT_MODEL_PATH), local_files_only=True
     )
     return bool(feature_extractor.do_normalize)
+
+
+def warm_embedder(model, version, is_half, device, samples):
+    """Run one throwaway pass, so the first live chunk is not late."""
+    dtype = torch.float16 if is_half else torch.float32
+    with torch.no_grad():
+        source = torch.zeros(1, samples, device=device, dtype=dtype)
+        extract_hubert_features(model, source, version)
 
 
 def extract_hubert_features(model, source, version, padding_mask=None):

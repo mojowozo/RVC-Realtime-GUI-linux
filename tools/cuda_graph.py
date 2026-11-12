@@ -233,6 +233,9 @@ def run_cuda_graph(owner, namespace, function, *inputs):
     if (
         not inputs
         or getattr(_thread_state, "eager", False)
+        # Set on a model swapped in while streaming (engine/core.py): capturing
+        # it on the audio thread would stall the stream.
+        or getattr(owner, "_rvc_cuda_graph_eager", False)
         or not cuda_graph_enabled(inputs[0].device)
     ):
         return function(*inputs)

@@ -106,6 +106,52 @@ class TrashError(Exception):
     pass
 
 
+class IndexFileError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def attach_index(model_directory, index_file, trash=None):
+    """Copy ``index_file`` into a model folder; return its new path.
+
+    The copy goes to a hidden temporary name first and is renamed into place
+    only when complete.  Index files already in the folder are passed to
+    ``trash`` (default: the desktop Trash), so the model has exactly one.
+    """
+    source = Path(index_file)
+    if source.suffix.lower() != ".index":
+        raise IndexFileError("index_not_index", f"Not an .index file: {source.name}")
+    if source.name.lower().startswith("trained_"):
+        # RVC trainers write trained_*.index (not usable for retrieval)
+        # beside added_*.index (the one to use).
+        raise IndexFileError(
+            "index_trained",
+            f"{source.name} is the trained_ index; use the added_ index from the same folder.",
+        )
+    if not source.is_file() or source.stat().st_size == 0:
+        raise IndexFileError("index_missing_file", f"Index file not found: {source}")
+    directory = Path(model_directory)
+    target = directory / source.name
+    temporary = directory / f".{source.name}.part"
+    try:
+        shutil.copyfile(source, temporary)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise IndexFileError("index_copy_failed", str(error)) from error
+    # Every index already there goes, including one with the same name.
+    old = sorted(path for path in directory.glob("*.index") if not path.name.startswith("."))
+    try:
+        for path in old:
+            (trash or move_to_trash)(path)
+    except (OSError, subprocess.SubprocessError, TrashError) as error:
+        temporary.unlink(missing_ok=True)
+        raise IndexFileError("index_copy_failed", f"Could not move the old index to the Trash: {error}") from error
+    os.replace(temporary, target)
+    return target, [path.name for path in old]
+
+
 def move_to_trash(path):
     """Move a model folder to the desktop Trash (recoverable), via ``gio``."""
     gio = shutil.which("gio")
