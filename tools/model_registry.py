@@ -19,7 +19,8 @@ class ModelEntry:
 def discover_models(models_root: str | Path) -> list[ModelEntry]:
     """Discover one RVC model per direct child directory.
 
-    A directory is listed when it contains at least one ``.pth`` file.
+    A directory is listed when it contains at least one ``.pth`` file (or,
+    failing that, a ``.nextvc.json`` voice description).
     When multiple files exist, names are sorted case-insensitively and the
     first file is selected.  An ``added_*.index`` file is preferred over
     other index files.
@@ -37,6 +38,11 @@ def discover_models(models_root: str | Path) -> list[ModelEntry]:
         model_files = sorted(
             directory.glob("*.pth"), key=lambda path: path.name.casefold()
         )
+        if not model_files:
+            # A voice of the streaming NextVC backend (infer/nextvc_backend.py).
+            model_files = sorted(
+                directory.glob("*.nextvc.json"), key=lambda path: path.name.casefold()
+            )
         if not model_files:
             continue
 
