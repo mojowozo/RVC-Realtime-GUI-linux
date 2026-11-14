@@ -43,7 +43,6 @@ from engine.settings import (
     save_settings,
 )
 from engine.version import APP_TITLE, BUILD_LABEL
-from infer import nextvc_backend
 from infer import rtrvc as rvc_for_realtime
 from infer.hubert import checkpoint_embedder, load_hubert_model, warm_embedder
 from tools.audio_fifo import AudioFrameFifo, enqueue_latest
@@ -448,7 +447,7 @@ class RealtimeEngine:
             for key, value in coerced.items()
             if getattr(self.settings, key) != value
         }
-        if "model_name" in changed and self.can_hot_swap(changed["model_name"]):
+        if "model_name" in changed and self.can_hot_swap():
             # Keep converting with the current voice while the new one loads.
             self.begin_model_swap(changed.pop("model_name"))
         if not changed:
@@ -532,10 +531,7 @@ class RealtimeEngine:
     # ------------------------------------------------------------------
     # Hot model swap: change voices without stopping the stream
     # ------------------------------------------------------------------
-    def can_hot_swap(self, name=None):
-        target = self.models_by_name.get(name) if name is not None else None
-        if target is not None and nextvc_backend.is_nextvc(target.model_path):
-            return False  # a different backend: the stream restarts instead
+    def can_hot_swap(self):
         return (
             self.running
             and self.function == "vc"
@@ -954,13 +950,7 @@ class RealtimeEngine:
             printt(traceback.format_exc())
             self.stop()
             raise EngineError("audio_start_failed", str(error)) from error
-        if self.stream is not None and self.nextvc_active:
-            self.delay_time = (
-                plausible_stream_latency(self.stream.latency)
-                + self.settings.block_time
-                + self.rvc.delay_seconds
-            )
-        elif self.stream is not None:
+        if self.stream is not None:
             stream_latency = plausible_stream_latency(self.stream.latency)
             # Each emitted block lags the input by the fade plus the WSOLA
             # search span, minus the (usually small) splice offset.
@@ -985,11 +975,8 @@ class RealtimeEngine:
                 f"Model file not found: {model.model_path}",
                 path=str(model.model_path),
             )
-        # A NextVC voice brings its own encoder and pitch tracker, and has no index.
-        own_assets = nextvc_backend.is_nextvc(model.model_path)
-        if not own_assets:
-            self.require_assets(self.settings.f0method)
-        if not own_assets and self.settings.index_rate > 0 and model.index_path is None:
+        self.require_assets(self.settings.f0method)
+        if self.settings.index_rate > 0 and model.index_path is None:
             raise EngineError(
                 "index_missing",
                 "The selected model has no .index file. "
@@ -1076,18 +1063,6 @@ class RealtimeEngine:
     def load_model(self, model):
         self.status("loading_model")
         torch.cuda.empty_cache()
-        if nextvc_backend.is_nextvc(model.model_path):
-            try:
-                self.rvc = nextvc_backend.NextVC(
-                    self.settings.pitch, str(model.model_path), self.config.device
-                )
-            except Exception as error:
-                raise EngineError(
-                    "model_load_failed",
-                    f"Could not load {model.model_path.name}: {error}",
-                    model=model.name,
-                ) from error
-            return
         try:
             self.rvc = rvc_for_realtime.RVC(
                 self.settings.pitch,
@@ -1119,14 +1094,6 @@ class RealtimeEngine:
         self.block_frame = (
             int(np.round(self.settings.block_time * self.samplerate / self.zc)) * self.zc
         )
-        if self.nextvc_active:
-            if samplerate != nextvc_backend.SAMPLE_RATE:
-                raise EngineError(
-                    "samplerate_unsupported", "This voice needs a 48 kHz audio route."
-                )
-            # Whole 20 ms frames; the block itself is the only chunking.
-            multiple = nextvc_backend.BLOCK_MULTIPLE
-            self.block_frame = max(1, round(self.block_frame / multiple)) * multiple
         self.block_frame_16k = 160 * self.block_frame // self.zc
         self.splicer = WsolaSplicer(self.samplerate, self.block_frame, self.config.device)
         self.splicer.matched_fade = self.settings.matched_fade
@@ -1207,9 +1174,6 @@ class RealtimeEngine:
             0.0, 1.0, steps=ramp, device=self.config.device, dtype=torch.float32
         )
         self.status("preparing_inference")
-        if self.nextvc_active:
-            self.rvc.warm(self.block_frame)
-            return
         self.prewarm_cuda_graph()
 
     def prewarm_cuda_graph(self):
@@ -1493,8 +1457,6 @@ class RealtimeEngine:
         if meter_now - self.last_input_meter_update >= METER_INTERVAL_SECONDS:
             self.latest_input_meter = peak_meter(indata)
             self.last_input_meter_update = meter_now
-        if self.function == "vc" and self.nextvc_active:
-            return self.nextvc_callback(indata, start_time)
         silent = self.function == "vc" and settings.hold_context and self.block_is_silent(indata)
         # Hold only from the second silent block in a row.  Output lags the
         # input by the 50 ms fade + search, so the first silent block's output
@@ -1591,24 +1553,6 @@ class RealtimeEngine:
         if resumed or self.stale_samples > 0:
             self.mute_stale_output(infer_wav, ramp=resumed)
         return self.finish_block(infer_wav, start_time)
-
-    @property
-    def nextvc_active(self):
-        return getattr(getattr(self, "rvc", None), "is_nextvc", False)
-
-    def nextvc_callback(self, indata, start_time):
-        """One block through the streaming backend.
-
-        Its output is continuous from block to block, so there is no context
-        window, splice or hold: every block is converted, silence included.
-        """
-        swap = self.pending_swap
-        if swap is not None:
-            self.pending_swap = None
-        self.ingest_block(indata)
-        source = self.input_wav_denoise if self.settings.input_denoise else self.input_wav
-        output = self.rvc.process(source[-self.block_frame :])
-        return self.finish_block(output, start_time)
 
     def input_denoise_delay(self):
         """Latency the active input denoiser adds, in seconds."""
